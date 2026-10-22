@@ -339,19 +339,33 @@ module.exports = (
         // Otherwise, the login itself is the end of the flow.
         flowCompleteSignal = 'account.login';
       }
-      request.setMetricsFlowCompleteSignal(
-        flowCompleteSignal,
-        'login',
-        // A passkey-verified session reaching here is the password step of a
-        // passkey sign-in, not an email login.
-        sessionToken.verificationMethodValue === 'passkey' ? 'passkey' : 'email'
-      );
+
+      // A passkey-verified session reaching here is the password step of a
+      // passkey sign-in, not an email login.
+      const isPasskeySession =
+        sessionToken.verificationMethodValue === 'passkey';
+      // For Sync, the passkey ceremony already recorded the login and stashed
+      // the signal of the step that completes the flow.
+      const loginRecordedByPasskey =
+        isPasskeySession &&
+        !!(await request.getStashedMetricsContext(sessionToken))
+          .flowCompleteSignal;
+
+      if (!loginRecordedByPasskey) {
+        request.setMetricsFlowCompleteSignal(
+          flowCompleteSignal,
+          'login',
+          isPasskeySession ? 'passkey' : 'email'
+        );
+      }
 
       await stashMetricsContext();
       await checkNumberOfActiveSessions();
       await emitLoginEvent();
       await sendEmail();
-      await recordSecurityEvent();
+      if (!loginRecordedByPasskey) {
+        await recordSecurityEvent();
+      }
       return;
 
       async function stashMetricsContext() {
@@ -381,11 +395,14 @@ module.exports = (
       }
 
       async function emitLoginEvent() {
-        await request.emitMetricsEvent('account.login', {
-          uid: accountRecord.uid,
-        });
+        if (!loginRecordedByPasskey) {
+          await request.emitMetricsEvent('account.login', {
+            uid: accountRecord.uid,
+          });
+        }
 
-        if (request.payload.reason === 'signin') {
+        // Passkey finish already notified attached services of this sign-in.
+        if (request.payload.reason === 'signin' && !isPasskeySession) {
           const geoData = request.app.geo;
           const country = geoData.location && geoData.location.country;
           const countryCode = geoData.location && geoData.location.countryCode;
@@ -589,7 +606,7 @@ module.exports = (
             location: request.app.geo.location,
             ...(clientId && { client_id: clientId }),
             ...(service && { service }),
-            method: 'password',
+            method: isPasskeySession ? 'passkey' : 'password',
           },
         });
       }

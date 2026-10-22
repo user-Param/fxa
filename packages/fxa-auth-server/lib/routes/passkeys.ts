@@ -5,6 +5,7 @@
 import * as isA from 'joi';
 import { Container } from 'typedi';
 import { PasskeyService } from '@fxa/accounts/passkey';
+import { MOBILE_OAUTH_NATIVE_CLIENT_IDS } from '@fxa/accounts/oauth';
 import {
   AuthClientInfoService,
   AuthRequest,
@@ -575,14 +576,21 @@ export class PasskeyHandler {
   async authenticationFinish(request: AuthRequest) {
     await this.customs.checkIpOnly(request, 'passkeyAuthFinish');
 
-    const { response, challenge, service, keysRequired, prfSupported } =
-      request.payload as {
-        response: AuthenticationResponseJSON;
-        challenge: string;
-        service?: string;
-        keysRequired: boolean;
-        prfSupported?: boolean;
-      };
+    const {
+      response,
+      challenge,
+      service,
+      keysRequired,
+      prfSupported,
+      metricsContext,
+    } = request.payload as {
+      response: AuthenticationResponseJSON;
+      challenge: string;
+      service?: string;
+      keysRequired: boolean;
+      prfSupported?: boolean;
+      metricsContext?: { clientId?: string };
+    };
 
     let uid: string;
     let scope: string | undefined;
@@ -622,7 +630,29 @@ export class PasskeyHandler {
     // Later steps of a keys-required sign-in (password creation, key fetch) send
     // no metrics context of their own, so stash it against the new session token
     // to keep them on the same flow.
+    // Desktop Sync completes at /oauth/token, keys-required mobile Sync at
+    // /oauth/authorization (identified by client id; desktop v3 sends none).
+    // Both restore this stash, as does /session/reauth, so set the signal first.
+    const isMobile = MOBILE_OAUTH_NATIVE_CLIENT_IDS.has(
+      metricsContext?.clientId?.toLowerCase() ?? ''
+    );
+    // Without a metrics context nothing is stashed, so Sync falls back to the
+    // non-Sync path and reauth records the login.
+    const isSync = service === 'sync' && !!metricsContext;
+    let stashedSignal: 'account.signed' | 'account.login' | undefined;
+    if (isSync && !isMobile) {
+      stashedSignal = 'account.signed';
+    } else if (isSync && keysRequired) {
+      stashedSignal = 'account.login';
+    }
+    if (stashedSignal) {
+      request.setMetricsFlowCompleteSignal(stashedSignal, 'login', 'passkey');
+    }
     await request.stashMetricsContext(sessionToken);
+    this.statsd.increment('passkeys.signin.completion_armed', {
+      step: completionStep(stashedSignal, keysRequired),
+      platform: isMobile ? 'mobile' : 'other',
+    });
 
     await recordSecurityEvent('account.passkey.authentication_success', {
       db: this.db,
@@ -634,14 +664,17 @@ export class PasskeyHandler {
     // the browser hasn't decoupled Sync) completes its key step later, at a
     // follow-up password step. Until then the new-device-login email is still
     // sent, but with a generic subject (no service framing, since keys aren't
-    // retrieved yet), and the account.login metric/flow-signal/security-event
-    // are deferred to that step. The client owns the keys-required decision; it
-    // depends on the browser's keys-optional capability.
+    // retrieved yet), and, except for Sync, the account.login
+    // metric/flow-signal/security-event are deferred to that step. Sync records
+    // the security event here and leaves completion to the stashed signal. The
+    // client owns the keys-required decision; it depends on the browser's
+    // keys-optional capability.
     await this.sendPostSigninNotifications(
       request,
       account,
       service,
-      keysRequired
+      keysRequired,
+      stashedSignal
     );
 
     const hasPassword = account.verifierSetAt > 0;
@@ -676,7 +709,8 @@ export class PasskeyHandler {
       locale?: string;
     },
     service: string | undefined,
-    keysRequired: boolean
+    keysRequired: boolean,
+    stashedSignal?: 'account.signed' | 'account.login'
   ) {
     // The new-device-login email is always sent; when keys are still required
     // we drop the service so the subject stays generic — keys aren't retrieved
@@ -695,7 +729,7 @@ export class PasskeyHandler {
         showBannerWarning: false,
       });
     } catch (err) {
-      this.log.trace(
+      this.log.error(
         'passkeys.authenticationFinish.sendNewDeviceLoginEmail.error',
         { error: err }
       );
@@ -717,18 +751,39 @@ export class PasskeyHandler {
         emailVerified: true,
         profileChanged: false,
       });
+    } catch (err) {
+      this.log.trace(
+        'passkeys.authenticationFinish.notifyAttachedServices.error',
+        { error: err }
+      );
+    }
 
-      // When keys are required the login completes at the later /session/reauth
-      // step, which emits these; skip them here to avoid double-counting.
-      if (!keysRequired) {
-        // Signal before emitting: emitMetricsEvent only recognises the flow as
-        // complete (and so records login.complete) if the signal is already set.
-        request.setMetricsFlowCompleteSignal(
-          'account.login',
-          'login',
-          'passkey'
-        );
+    // A non-Sync login that requires keys completes at the later
+    // /session/reauth step, which emits these; skip them here to avoid
+    // double-counting. A stashed account.login is emitted by
+    // /oauth/authorization, which completes the flow.
+    try {
+      if (!keysRequired || stashedSignal === 'account.signed') {
+        if (!stashedSignal) {
+          // Signal before emitting: emitMetricsEvent only recognises the flow
+          // as complete (and so records login.complete) if the signal is
+          // already set.
+          request.setMetricsFlowCompleteSignal(
+            'account.login',
+            'login',
+            'passkey'
+          );
+        }
         await request.emitMetricsEvent('account.login', { uid: account.uid });
+      }
+    } catch (err) {
+      this.log.trace('passkeys.authenticationFinish.loginMetrics.error', {
+        error: err,
+      });
+    }
+
+    try {
+      if (!keysRequired || stashedSignal) {
         await recordSecurityEvent('account.login', {
           db: this.db,
           request,
@@ -737,10 +792,9 @@ export class PasskeyHandler {
         });
       }
     } catch (err) {
-      this.log.trace(
-        'passkeys.authenticationFinish.postSigninNotifications.error',
-        { error: err }
-      );
+      this.log.error('passkeys.authenticationFinish.securityEvent.error', {
+        error: err,
+      });
     }
   }
 
@@ -1238,3 +1292,17 @@ export const passkeyRoutes = (
 };
 
 export default passkeyRoutes;
+
+/** The request expected to complete a passkey sign-in's flow. */
+function completionStep(
+  stashedSignal: 'account.signed' | 'account.login' | undefined,
+  keysRequired: boolean
+) {
+  if (stashedSignal === 'account.signed') {
+    return 'oauth_token';
+  }
+  if (stashedSignal === 'account.login') {
+    return 'oauth_authorization';
+  }
+  return keysRequired ? 'reauth' : 'finish';
+}

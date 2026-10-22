@@ -1603,11 +1603,87 @@ describe('passkeys routes', () => {
         });
 
         expect(result.uid).toBe(UID);
-        expect(log.trace).toHaveBeenCalledWith(
+        expect(log.error).toHaveBeenCalledWith(
           'passkeys.authenticationFinish.sendNewDeviceLoginEmail.error',
           { error: expect.any(Error) }
         );
         expect(log.notifyAttachedServices).toHaveBeenCalledTimes(1);
+      });
+
+      describe('when the account.login security event fails', () => {
+        const securityEventError = new Error('db down');
+
+        beforeEach(() => {
+          jest.mocked(recordSecurityEvent).mockImplementation(async (name) => {
+            if (name === 'account.login') {
+              throw securityEventError;
+            }
+          });
+        });
+
+        afterEach(() => {
+          jest.mocked(recordSecurityEvent).mockReset();
+        });
+
+        it('does not reject the sign-in', async () => {
+          const result = await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload,
+          });
+
+          expect(result.uid).toBe(UID);
+        });
+
+        it('logs the failure as an error', async () => {
+          await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload,
+          });
+
+          expect(log.error).toHaveBeenCalledWith(
+            'passkeys.authenticationFinish.securityEvent.error',
+            { error: securityEventError }
+          );
+        });
+      });
+
+      describe('when notifying attached services fails', () => {
+        beforeEach(() => {
+          log.notifyAttachedServices = jest
+            .fn()
+            .mockRejectedValue(new Error('pubsub down'));
+        });
+
+        it('still emits the account.login metrics event', async () => {
+          await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload,
+          });
+
+          expect(request.emitMetricsEvent).toHaveBeenCalledWith(
+            'account.login',
+            { uid: UID }
+          );
+        });
+
+        it('still records the account.login security event', async () => {
+          await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload,
+          });
+
+          expect(recordSecurityEvent).toHaveBeenCalledWith(
+            'account.login',
+            expect.objectContaining({
+              account: { uid: UID },
+              method: 'passkey',
+            })
+          );
+        });
       });
 
       it('notifies attached services of the login', async () => {
@@ -1708,9 +1784,8 @@ describe('passkeys routes', () => {
       });
 
       // The client owns the defer decision (it depends on the browser's
-      // keys-optional capability); `service` does not influence it. The two
-      // tests below pair a deferring login with a non-Sync service and a
-      // non-deferring login with service=sync to prove that independence.
+      // keys-optional capability). Outside Sync, `service` does not influence
+      // it; Sync never defers.
       it('defers account.login and sends a generic-subject email when keysRequired is true, regardless of service', async () => {
         await runTest('/passkey/authentication/finish', {
           auth: { credentials: {} },
@@ -1754,6 +1829,161 @@ describe('passkeys routes', () => {
 
         expect(request.emitMetricsEvent).toHaveBeenCalledWith('account.login', {
           uid: UID,
+        });
+      });
+
+      it('leaves a keys-required Sync login without a metrics context to reauth', async () => {
+        await runTest('/passkey/authentication/finish', {
+          auth: { credentials: {} },
+          app: { ua: {} },
+          payload: { ...payload, service: 'sync', keysRequired: true },
+        });
+
+        expect(request.setMetricsFlowCompleteSignal).not.toHaveBeenCalled();
+        expect(recordSecurityEvent).not.toHaveBeenCalledWith(
+          'account.login',
+          expect.objectContaining({ method: 'passkey' })
+        );
+      });
+
+      it.each([
+        { keysRequired: false, step: 'finish' },
+        { keysRequired: true, step: 'reauth' },
+      ])(
+        'counts a non-Sync flow with keysRequired=$keysRequired as armed to complete at $step',
+        async ({ keysRequired, step }) => {
+          await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload: { ...payload, service: 'vpn', keysRequired },
+          });
+
+          expect(statsd.increment).toHaveBeenCalledWith(
+            'passkeys.signin.completion_armed',
+            { step, platform: 'other' }
+          );
+        }
+      );
+
+      // Desktop completes at /oauth/token (account.signed); mobile completes
+      // at /oauth/authorization once it sends keys (account.login).
+      // Desktop v3 sends no client id; it completes at /oauth/token too.
+      describe.each([
+        {
+          platform: 'desktop',
+          clientId: '5882386c6d801776',
+          signal: 'account.signed',
+          step: 'oauth_token',
+        },
+        {
+          platform: 'desktop v3',
+          clientId: undefined,
+          signal: 'account.signed',
+          step: 'oauth_token',
+        },
+        {
+          platform: 'mobile',
+          clientId: 'a2270f727f45f648',
+          signal: 'account.login',
+          step: 'oauth_authorization',
+        },
+      ])('$platform Sync with keys required', ({ clientId, signal, step }) => {
+        const syncPayload = {
+          ...payload,
+          service: 'sync',
+          keysRequired: true,
+          metricsContext: clientId ? { clientId } : {},
+        };
+
+        it(`counts the flow as armed to complete at ${step}`, async () => {
+          await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload: syncPayload,
+          });
+
+          expect(statsd.increment).toHaveBeenCalledWith(
+            'passkeys.signin.completion_armed',
+            {
+              step,
+              platform: signal === 'account.login' ? 'mobile' : 'other',
+            }
+          );
+        });
+
+        it(`sets only the ${signal} flow signal`, async () => {
+          await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload: syncPayload,
+          });
+
+          expect(request.setMetricsFlowCompleteSignal).toHaveBeenCalledTimes(1);
+          expect(request.setMetricsFlowCompleteSignal).toHaveBeenCalledWith(
+            signal,
+            'login',
+            'passkey'
+          );
+        });
+
+        it('sets the flow signal before stashing the metrics context', async () => {
+          await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload: syncPayload,
+          });
+
+          // /oauth/token and /session/reauth read the stash; a signal set
+          // after it is lost.
+          expect(
+            request.setMetricsFlowCompleteSignal.mock.invocationCallOrder[0]
+          ).toBeLessThan(
+            request.stashMetricsContext.mock.invocationCallOrder[0]
+          );
+        });
+
+        if (signal === 'account.signed') {
+          it('emits the account.login metrics event', async () => {
+            await runTest('/passkey/authentication/finish', {
+              auth: { credentials: {} },
+              app: { ua: {} },
+              payload: syncPayload,
+            });
+
+            expect(request.emitMetricsEvent).toHaveBeenCalledWith(
+              'account.login',
+              { uid: UID }
+            );
+          });
+        } else {
+          it('defers the account.login metrics event to /oauth/authorization', async () => {
+            await runTest('/passkey/authentication/finish', {
+              auth: { credentials: {} },
+              app: { ua: {} },
+              payload: syncPayload,
+            });
+
+            expect(request.emitMetricsEvent).not.toHaveBeenCalledWith(
+              'account.login',
+              { uid: UID }
+            );
+          });
+        }
+
+        it('records the account.login security event with method passkey', async () => {
+          await runTest('/passkey/authentication/finish', {
+            auth: { credentials: {} },
+            app: { ua: {} },
+            payload: syncPayload,
+          });
+
+          expect(recordSecurityEvent).toHaveBeenCalledWith(
+            'account.login',
+            expect.objectContaining({
+              account: { uid: UID },
+              method: 'passkey',
+            })
+          );
         });
       });
     });
